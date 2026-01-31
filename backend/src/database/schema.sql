@@ -1,0 +1,562 @@
+-- =============================================================================
+-- Side Hustle Tax & Income Tracker Database Schema
+-- =============================================================================
+-- Version: 1.1.0
+-- Last Updated: January 29, 2026
+-- Description: Reference schema document for the complete database structure
+--
+-- NOTE: This file is for REFERENCE ONLY. The actual schema is created by
+-- running `npm run migrate` which executes the inline migrations in migrate.ts
+--
+-- Tables included:
+-- 1. users - User accounts and preferences
+-- 2. expense_categories - IRS Schedule C categories
+-- 3. accounts - Connected financial accounts (Plaid, Stripe, etc.)
+-- 4. transactions - Imported transactions from connected accounts
+-- 5. manual_expenses - Manually entered expenses and receipts
+-- 6. category_rules - User-defined categorization rules
+-- 7. tax_estimates - Quarterly tax estimate calculations
+-- 8. income_thresholds - IRS $5K threshold tracking
+-- 9. notifications - User notifications and alerts
+-- 10. tax_deadlines - Quarterly tax deadline reference data
+-- 11. user_sessions - Active user sessions for security
+-- 12. migrations - Tracks executed database migrations
+-- =============================================================================
+
+-- =============================================================================
+-- 1. USERS TABLE
+-- Stores user account information, tax preferences, and notification settings
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS users (
+    user_id UUID PRIMARY KEY,
+    email VARCHAR(255) UNIQUE NOT NULL,
+    password_hash VARCHAR(255), -- NULL for OAuth-only users
+    full_name VARCHAR(255) NOT NULL,
+
+    -- Tax Settings
+    tax_filing_status VARCHAR(50) DEFAULT 'single'
+        CHECK (tax_filing_status IN ('single', 'married_joint', 'married_separate', 'head_of_household')),
+    marginal_tax_rate DECIMAL(5,2) DEFAULT 22.00,
+    w2_withholding_annual DECIMAL(12,2) DEFAULT 0.00,
+
+    -- OAuth Providers
+    google_id VARCHAR(255) UNIQUE,
+
+    -- User Profile Settings
+    primary_platform VARCHAR(50), -- e.g., 'uber', 'doordash', 'freelance'
+    onboarding_completed BOOLEAN DEFAULT FALSE,
+    onboarding_step INTEGER DEFAULT 0,
+
+    -- Notification Preferences (JSON for flexibility)
+    notification_preferences JSONB DEFAULT '{
+        "push_enabled": true,
+        "email_enabled": true,
+        "threshold_alerts": true,
+        "deadline_reminders": true,
+        "weekly_digest": true,
+        "transaction_review": true,
+        "quiet_hours_start": null,
+        "quiet_hours_end": null
+    }'::jsonb,
+
+    -- Timestamps
+    email_verified_at TIMESTAMP,
+    last_login_at TIMESTAMP,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+CREATE INDEX IF NOT EXISTS idx_users_google_id ON users(google_id);
+
+-- =============================================================================
+-- 2. EXPENSE CATEGORIES TABLE
+-- IRS Schedule C expense categories with metadata for auto-categorization
+-- Seeded with data from seeds/001_expense_categories.sql
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS expense_categories (
+    category_id UUID PRIMARY KEY,
+    category_name VARCHAR(100) NOT NULL UNIQUE,
+    category_code VARCHAR(20) NOT NULL UNIQUE, -- e.g., 'car_truck', 'supplies'
+    irs_line_number VARCHAR(10), -- Schedule C line reference
+    deduction_rate DECIMAL(3,2) DEFAULT 1.00, -- e.g., 0.50 for meals (50% deductible)
+    description TEXT,
+    keywords TEXT[], -- Keywords for auto-categorization
+    mcc_codes VARCHAR(10)[], -- Merchant Category Codes
+    sort_order INTEGER DEFAULT 0,
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_expense_categories_code ON expense_categories(category_code);
+
+-- =============================================================================
+-- 3. ACCOUNTS TABLE
+-- Stores connected financial accounts (Plaid, Stripe, etc.)
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS accounts (
+    account_id UUID PRIMARY KEY,
+    user_id UUID NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+
+    -- Platform Information
+    platform VARCHAR(50) NOT NULL
+        CHECK (platform IN ('plaid_bank', 'venmo', 'paypal', 'cashapp', 'stripe', 'manual')),
+    account_name VARCHAR(255) NOT NULL,
+    account_type VARCHAR(50), -- 'checking', 'savings', 'credit', etc.
+    account_mask VARCHAR(10), -- Last 4 digits for display
+    institution_name VARCHAR(255),
+    institution_id VARCHAR(100),
+
+    -- Plaid-specific fields
+    plaid_access_token TEXT, -- Encrypted at application level
+    plaid_item_id VARCHAR(255),
+    plaid_account_id VARCHAR(255),
+
+    -- Stripe-specific fields
+    stripe_account_id VARCHAR(255),
+
+    -- Connection Status
+    connection_status VARCHAR(50) DEFAULT 'connected'
+        CHECK (connection_status IN ('connected', 'disconnected', 'error', 'pending')),
+    connection_error_code VARCHAR(100),
+    connection_error_message TEXT,
+
+    -- Sync Information
+    last_synced_at TIMESTAMP,
+    sync_cursor VARCHAR(255), -- For Plaid pagination
+
+    -- Timestamps
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_accounts_user_id ON accounts(user_id);
+CREATE INDEX IF NOT EXISTS idx_accounts_plaid_item_id ON accounts(plaid_item_id);
+CREATE INDEX IF NOT EXISTS idx_accounts_plaid_account_id ON accounts(plaid_account_id);
+CREATE INDEX IF NOT EXISTS idx_accounts_stripe_account_id ON accounts(stripe_account_id);
+
+-- =============================================================================
+-- 4. TRANSACTIONS TABLE
+-- Stores imported transactions from connected accounts
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS transactions (
+    transaction_id UUID PRIMARY KEY,
+    user_id UUID NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    account_id UUID NOT NULL REFERENCES accounts(account_id) ON DELETE CASCADE,
+
+    -- External IDs for deduplication
+    external_transaction_id VARCHAR(255) NOT NULL,
+    plaid_transaction_id VARCHAR(255),
+
+    -- Transaction Details
+    transaction_date DATE NOT NULL,
+    posted_date DATE,
+    amount DECIMAL(12,2) NOT NULL, -- Positive for income, negative for expenses
+    iso_currency_code VARCHAR(3) DEFAULT 'USD',
+
+    -- Description and Merchant
+    description TEXT,
+    original_description TEXT, -- Preserve original from Plaid
+    merchant_name VARCHAR(255),
+    merchant_category VARCHAR(255), -- From Plaid
+
+    -- Categorization
+    mcc_code VARCHAR(10),
+    transaction_type VARCHAR(50) NOT NULL
+        CHECK (transaction_type IN ('income', 'expense', 'transfer', 'refund', 'unknown')),
+    category_id UUID REFERENCES expense_categories(category_id),
+    is_business BOOLEAN,
+    business_percentage DECIMAL(5,2) DEFAULT 100.00, -- For partial business use
+
+    -- Auto-categorization metadata
+    categorization_source VARCHAR(50) DEFAULT 'auto'
+        CHECK (categorization_source IN ('auto', 'user', 'rule', 'ai')),
+    categorization_confidence DECIMAL(3,2),
+    reviewed_by_user BOOLEAN DEFAULT FALSE,
+    review_required BOOLEAN DEFAULT FALSE,
+
+    -- Additional flags
+    is_duplicate BOOLEAN DEFAULT FALSE,
+    is_excluded BOOLEAN DEFAULT FALSE, -- Exclude from calculations
+    exclude_reason VARCHAR(255),
+
+    -- Notes
+    notes TEXT,
+
+    -- Timestamps
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+
+    -- Prevent duplicate transaction imports
+    CONSTRAINT unique_external_transaction UNIQUE (account_id, external_transaction_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_transactions_user_id ON transactions(user_id);
+CREATE INDEX IF NOT EXISTS idx_transactions_account_id ON transactions(account_id);
+CREATE INDEX IF NOT EXISTS idx_transactions_date ON transactions(transaction_date);
+CREATE INDEX IF NOT EXISTS idx_transactions_external_id ON transactions(external_transaction_id);
+CREATE INDEX IF NOT EXISTS idx_transactions_plaid_id ON transactions(plaid_transaction_id);
+CREATE INDEX IF NOT EXISTS idx_transactions_type ON transactions(transaction_type);
+CREATE INDEX IF NOT EXISTS idx_transactions_is_business ON transactions(is_business);
+CREATE INDEX IF NOT EXISTS idx_transactions_review ON transactions(user_id, review_required) WHERE review_required = TRUE;
+CREATE INDEX IF NOT EXISTS idx_transactions_user_date ON transactions(user_id, transaction_date DESC);
+CREATE INDEX IF NOT EXISTS idx_transactions_user_type_date ON transactions(user_id, transaction_type, transaction_date DESC);
+
+-- =============================================================================
+-- 5. MANUAL EXPENSES TABLE
+-- Stores manually entered expenses and receipt scans
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS manual_expenses (
+    manual_expense_id UUID PRIMARY KEY,
+    user_id UUID NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+
+    -- Expense Details
+    expense_date DATE NOT NULL,
+    merchant VARCHAR(255) NOT NULL,
+    amount DECIMAL(12,2) NOT NULL,
+    category_id UUID REFERENCES expense_categories(category_id),
+    category_name VARCHAR(100) NOT NULL, -- Denormalized for performance
+
+    -- Business Classification
+    is_business BOOLEAN DEFAULT TRUE,
+    business_percentage DECIMAL(5,2) DEFAULT 100.00,
+
+    -- Additional Details
+    notes TEXT,
+    payment_method VARCHAR(50), -- 'cash', 'card', 'check', etc.
+
+    -- Receipt Information
+    receipt_photo_url VARCHAR(500), -- S3 URL
+    receipt_thumbnail_url VARCHAR(500),
+    ocr_raw_text TEXT,
+    ocr_confidence DECIMAL(3,2),
+    ocr_extracted_data JSONB, -- Structured OCR results
+
+    -- Mileage-specific fields (for mileage expenses)
+    is_mileage BOOLEAN DEFAULT FALSE,
+    miles DECIMAL(10,2),
+    mileage_rate DECIMAL(4,2), -- IRS rate at time of entry
+    start_location VARCHAR(255),
+    end_location VARCHAR(255),
+
+    -- Timestamps
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_manual_expenses_user_id ON manual_expenses(user_id);
+CREATE INDEX IF NOT EXISTS idx_manual_expenses_date ON manual_expenses(expense_date);
+CREATE INDEX IF NOT EXISTS idx_manual_expenses_category ON manual_expenses(category_id);
+CREATE INDEX IF NOT EXISTS idx_manual_expenses_user_date ON manual_expenses(user_id, expense_date DESC);
+
+-- =============================================================================
+-- 6. CATEGORY RULES TABLE
+-- User-defined and learned categorization rules
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS category_rules (
+    rule_id UUID PRIMARY KEY,
+    user_id UUID NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+
+    -- Rule Definition
+    rule_type VARCHAR(50) NOT NULL
+        CHECK (rule_type IN ('keyword', 'merchant', 'mcc', 'amount_range', 'combined')),
+    rule_name VARCHAR(255),
+
+    -- Match Criteria
+    keyword_pattern VARCHAR(255), -- Regex or simple match
+    merchant_pattern VARCHAR(255),
+    mcc_codes VARCHAR(10)[],
+    amount_min DECIMAL(12,2),
+    amount_max DECIMAL(12,2),
+
+    -- Result Action
+    category_id UUID REFERENCES expense_categories(category_id),
+    is_business BOOLEAN,
+    transaction_type VARCHAR(50),
+
+    -- Rule Metadata
+    match_count INTEGER DEFAULT 0, -- How many times this rule matched
+    is_active BOOLEAN DEFAULT TRUE,
+    priority INTEGER DEFAULT 0, -- Higher = checked first
+    is_system_rule BOOLEAN DEFAULT FALSE, -- System vs user-created
+
+    -- Timestamps
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_category_rules_user_id ON category_rules(user_id);
+CREATE INDEX IF NOT EXISTS idx_category_rules_active ON category_rules(user_id, is_active) WHERE is_active = TRUE;
+
+-- =============================================================================
+-- 7. TAX ESTIMATES TABLE
+-- Stores quarterly tax estimate calculations
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS tax_estimates (
+    tax_estimate_id UUID PRIMARY KEY,
+    user_id UUID NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+
+    -- Period
+    tax_year INTEGER NOT NULL,
+    quarter INTEGER NOT NULL CHECK (quarter BETWEEN 1 AND 4),
+    period_start_date DATE NOT NULL,
+    period_end_date DATE NOT NULL,
+
+    -- Income
+    total_income DECIMAL(12,2) NOT NULL DEFAULT 0,
+    income_by_platform JSONB DEFAULT '{}'::jsonb, -- Breakdown by source
+
+    -- Deductions
+    total_deductions DECIMAL(12,2) NOT NULL DEFAULT 0,
+    deductions_by_category JSONB DEFAULT '{}'::jsonb, -- Breakdown by category
+
+    -- Calculations
+    net_profit DECIMAL(12,2) NOT NULL DEFAULT 0,
+
+    -- Self-Employment Tax (SE Tax)
+    se_taxable_income DECIMAL(12,2) NOT NULL DEFAULT 0, -- Net * 0.9235
+    self_employment_tax DECIMAL(12,2) NOT NULL DEFAULT 0,
+    se_tax_deduction DECIMAL(12,2) NOT NULL DEFAULT 0, -- 50% of SE tax
+
+    -- Income Tax
+    taxable_income DECIMAL(12,2) NOT NULL DEFAULT 0,
+    income_tax DECIMAL(12,2) NOT NULL DEFAULT 0,
+    effective_tax_rate DECIMAL(5,2),
+
+    -- W2 Adjustments
+    w2_withholding_applied DECIMAL(12,2) DEFAULT 0,
+
+    -- Final Estimates
+    total_tax_owed DECIMAL(12,2) NOT NULL DEFAULT 0,
+    quarterly_payment_amount DECIMAL(12,2) NOT NULL DEFAULT 0,
+
+    -- Status
+    calculation_status VARCHAR(50) DEFAULT 'current'
+        CHECK (calculation_status IN ('current', 'stale', 'manual_override')),
+    calculated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+
+    -- One estimate per quarter per user
+    CONSTRAINT unique_user_quarter UNIQUE (user_id, tax_year, quarter)
+);
+
+CREATE INDEX IF NOT EXISTS idx_tax_estimates_user_year_quarter
+    ON tax_estimates(user_id, tax_year, quarter);
+
+-- =============================================================================
+-- 8. INCOME THRESHOLDS TABLE
+-- Track user's progress toward IRS reporting thresholds ($5K for 1099-K)
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS income_thresholds (
+    threshold_id UUID PRIMARY KEY,
+    user_id UUID NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+
+    tax_year INTEGER NOT NULL,
+
+    -- Running totals
+    total_1099_income DECIMAL(12,2) DEFAULT 0,
+    total_platform_income JSONB DEFAULT '{}'::jsonb,
+
+    -- Threshold tracking
+    threshold_5000_reached BOOLEAN DEFAULT FALSE,
+    threshold_5000_reached_at TIMESTAMP,
+    threshold_4000_alert_sent BOOLEAN DEFAULT FALSE,
+    threshold_4000_alert_sent_at TIMESTAMP,
+    threshold_5000_alert_sent BOOLEAN DEFAULT FALSE,
+    threshold_5000_alert_sent_at TIMESTAMP,
+
+    -- Timestamps
+    last_calculated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT unique_user_threshold_year UNIQUE (user_id, tax_year)
+);
+
+CREATE INDEX IF NOT EXISTS idx_income_thresholds_user_year ON income_thresholds(user_id, tax_year);
+
+-- =============================================================================
+-- 9. NOTIFICATIONS TABLE
+-- Stores user notifications (alerts, reminders, etc.)
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS notifications (
+    notification_id UUID PRIMARY KEY,
+    user_id UUID NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+
+    -- Notification Content
+    notification_type VARCHAR(50) NOT NULL
+        CHECK (notification_type IN (
+            'threshold_alert',
+            'deadline_reminder',
+            'review_needed',
+            'connection_error',
+            'weekly_digest',
+            'system_announcement',
+            'tax_tip'
+        )),
+    title VARCHAR(255) NOT NULL,
+    message TEXT NOT NULL,
+
+    -- Action
+    action_type VARCHAR(50), -- 'navigate', 'external_link', 'dismiss'
+    action_url VARCHAR(500),
+    action_data JSONB,
+
+    -- Delivery
+    delivery_channel VARCHAR(50)[] DEFAULT ARRAY['in_app'],
+    push_sent BOOLEAN DEFAULT FALSE,
+    push_sent_at TIMESTAMP,
+    email_sent BOOLEAN DEFAULT FALSE,
+    email_sent_at TIMESTAMP,
+
+    -- Status
+    is_read BOOLEAN DEFAULT FALSE,
+    read_at TIMESTAMP,
+    is_dismissed BOOLEAN DEFAULT FALSE,
+    dismissed_at TIMESTAMP,
+
+    -- Scheduling
+    scheduled_for TIMESTAMP,
+    expires_at TIMESTAMP,
+
+    -- Timestamps
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_notifications_user_id ON notifications(user_id);
+CREATE INDEX IF NOT EXISTS idx_notifications_unread ON notifications(user_id, is_read) WHERE is_read = FALSE;
+CREATE INDEX IF NOT EXISTS idx_notifications_type ON notifications(notification_type);
+CREATE INDEX IF NOT EXISTS idx_notifications_scheduled ON notifications(scheduled_for) WHERE scheduled_for IS NOT NULL;
+
+-- =============================================================================
+-- 10. TAX DEADLINES TABLE
+-- Reference table for quarterly tax deadlines
+-- Seeded with data from seeds/002_tax_deadlines.sql
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS tax_deadlines (
+    deadline_id UUID PRIMARY KEY,
+    tax_year INTEGER NOT NULL,
+    quarter INTEGER NOT NULL CHECK (quarter BETWEEN 1 AND 4),
+
+    -- Period covered
+    period_start_date DATE NOT NULL,
+    period_end_date DATE NOT NULL,
+
+    -- Deadline
+    due_date DATE NOT NULL,
+
+    -- Holiday adjustment info
+    original_due_date DATE,
+    holiday_adjusted BOOLEAN DEFAULT FALSE,
+
+    CONSTRAINT unique_deadline_year_quarter UNIQUE (tax_year, quarter)
+);
+
+CREATE INDEX IF NOT EXISTS idx_tax_deadlines_year ON tax_deadlines(tax_year);
+
+-- =============================================================================
+-- 11. ESTIMATED PAYMENTS TABLE
+-- Track estimated tax payments made by users
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS estimated_payments (
+    payment_id UUID PRIMARY KEY,
+    user_id UUID NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    tax_year INTEGER NOT NULL,
+    quarter INTEGER NOT NULL CHECK (quarter BETWEEN 1 AND 4),
+    payment_date DATE NOT NULL,
+    amount DECIMAL(12,2) NOT NULL,
+    payment_method VARCHAR(50) NOT NULL,
+    confirmation_number VARCHAR(100),
+    notes TEXT,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_estimated_payments_user_id ON estimated_payments(user_id);
+CREATE INDEX IF NOT EXISTS idx_estimated_payments_user_year ON estimated_payments(user_id, tax_year);
+CREATE INDEX IF NOT EXISTS idx_estimated_payments_quarter ON estimated_payments(user_id, tax_year, quarter);
+
+-- =============================================================================
+-- 12. USER SESSIONS TABLE
+-- Track user sessions for security and analytics
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS user_sessions (
+    session_id UUID PRIMARY KEY,
+    user_id UUID NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+
+    -- Session info
+    refresh_token_hash VARCHAR(255), -- Hashed for security
+    device_info JSONB, -- User agent, device type, etc.
+    ip_address VARCHAR(45),
+
+    -- Status
+    is_active BOOLEAN DEFAULT TRUE,
+    revoked_at TIMESTAMP,
+    revoke_reason VARCHAR(255),
+
+    -- Timestamps
+    last_activity_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMP NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_sessions_user_id ON user_sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_user_sessions_active ON user_sessions(user_id, is_active) WHERE is_active = TRUE;
+
+-- =============================================================================
+-- 12. MIGRATIONS TABLE
+-- Tracks executed database migrations
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS migrations (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(255) NOT NULL UNIQUE,
+    executed_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+-- =============================================================================
+-- UTILITY FUNCTIONS
+-- =============================================================================
+
+-- Function to update updated_at timestamp automatically
+CREATE OR REPLACE FUNCTION update_updated_at_column()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ language 'plpgsql';
+
+-- Apply updated_at triggers to relevant tables
+DROP TRIGGER IF EXISTS update_users_updated_at ON users;
+CREATE TRIGGER update_users_updated_at
+    BEFORE UPDATE ON users
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at_column();
+
+DROP TRIGGER IF EXISTS update_accounts_updated_at ON accounts;
+CREATE TRIGGER update_accounts_updated_at
+    BEFORE UPDATE ON accounts
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at_column();
+
+DROP TRIGGER IF EXISTS update_transactions_updated_at ON transactions;
+CREATE TRIGGER update_transactions_updated_at
+    BEFORE UPDATE ON transactions
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at_column();
+
+DROP TRIGGER IF EXISTS update_manual_expenses_updated_at ON manual_expenses;
+CREATE TRIGGER update_manual_expenses_updated_at
+    BEFORE UPDATE ON manual_expenses
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at_column();
+
+DROP TRIGGER IF EXISTS update_category_rules_updated_at ON category_rules;
+CREATE TRIGGER update_category_rules_updated_at
+    BEFORE UPDATE ON category_rules
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at_column();
+
+DROP TRIGGER IF EXISTS update_income_thresholds_updated_at ON income_thresholds;
+CREATE TRIGGER update_income_thresholds_updated_at
+    BEFORE UPDATE ON income_thresholds
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at_column();

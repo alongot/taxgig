@@ -1,0 +1,68 @@
+# TaxGig
+
+> Smart Tax Tracking for Gig Workers
+
+TaxGig is an intelligent financial management platform designed specifically for independent workers who need to track income, expenses, and quarterly tax estimates from multiple income sources.
+
+## Core Features
+
+- **Bank Account Sync**: Connect bank accounts via Plaid for automatic transaction import
+- **Smart Categorization**: AI-powered expense categorization for tax deductions
+- **Quarterly Tax Estimates**: Automatic calculation of estimated quarterly tax payments
+- **Mileage Tracking**: IRS-compliant mileage logging with current rate calculations
+- **Multi-Platform Income**: Track earnings from Uber, DoorDash, Upwork, Etsy, and more
+- **Expense Management**: Manual expense entry with receipt tracking
+- **Tax Reports**: Generate Schedule C and quarterly payment reports
+- **Invoice Generation**: Send professional invoices to clients
+
+## Target Users
+
+- Rideshare drivers (Uber, Lyft)
+- Delivery drivers (DoorDash, Instacart, Grubhub)
+- Freelancers (Upwork, Fiverr, Toptal)
+- E-commerce sellers (Etsy, eBay, Amazon)
+- Content creators
+- Consultants
+- Any independent contractor or self-employed individual
+
+## Technical Stack
+
+- Frontend: Next.js 16, React, TypeScript, Tailwind CSS
+- Backend: Node.js, Express, TypeScript
+- Database: PostgreSQL
+- Bank Integration: Plaid API
+- Authentication: JWT with secure session management
+
+## API Endpoints
+
+The platform exposes RESTful APIs for:
+- User authentication and profile management
+- Transaction management and categorization
+- Expense tracking and mileage logging
+- Tax calculation and quarterly estimates
+- Bank account connection via Plaid Link
+- Report generation
+
+## Tax Categories Supported
+
+- Vehicle expenses and mileage
+- Home office deduction
+- Supplies and equipment
+- Software and subscriptions
+- Professional services
+- Advertising and marketing
+- Insurance premiums
+- Business meals
+- Travel expenses
+- Utilities (business portion)
+
+## Compliance
+
+- IRS Schedule C compatible
+- Quarterly estimated tax (Form 1040-ES) support
+- Current year mileage rate updates
+- State tax consideration
+
+## Contact
+
+For more information, visit the application or contact support.
